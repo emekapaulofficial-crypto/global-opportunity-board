@@ -54,7 +54,7 @@ CATEGORIES = [
     "healthcare assistant visa sponsorship",
     "nursing visa sponsorship",
 ]
-COUNTRIES = ["au", "gb", "ca", "de", "nl", "ie", "nz", "se", "at", "pl", "za"]
+COUNTRIES = ["au", "gb", "ca", "de", "nl", "at", "pl", "za", "sg", "it", "fr"]
 
 MASTER_SEARCHES = [
     {"country": c, "what": cat} for c in COUNTRIES for cat in CATEGORIES
