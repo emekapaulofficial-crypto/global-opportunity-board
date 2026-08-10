@@ -2,12 +2,12 @@ name: Update Job & Scholarship Listings
 
 on:
   schedule:
-    # Runs 4 times a day (00:00, 06:00, 12:00, 18:00 UTC) — no manual work needed
+    # Runs 4 times a day (00:00, 06:00, 12:00, 18:00 UTC) — fully automatic
     - cron: "0 */6 * * *"
   workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
 
 permissions:
-  contents: write   # needed so the workflow can commit data/listings.json back
+  contents: write   # required so the workflow can save the updated file back to the repo
 
 jobs:
   update:
@@ -33,16 +33,10 @@ jobs:
       - name: Run scholarship scraper
         run: python scripts/fetch_scholarships.py
 
-      # This is what makes it fully automatic with no Google Sheet: the
-      # scrapers write straight into data/listings.json, and this step
-      # commits + pushes that file back to the repo. Cloudflare Pages is
-      # watching the repo, so that push alone triggers a redeploy — the
-      # live site picks up the new listings within a minute or two, with
-      # zero manual steps.
-      - name: Commit updated listings
+      - name: Commit updated listings back to the repo
         run: |
           git config user.name "opportunity-desk-bot"
-          git config user.email "actions@users.noreply.github.com"
+          git config user.email "actions@github.com"
           git add data/listings.json
-          git diff --staged --quiet && echo "No new listings this run." || git commit -m "Auto-update listings [skip ci]"
+          git diff --quiet --cached || git commit -m "Auto-update listings"
           git push
