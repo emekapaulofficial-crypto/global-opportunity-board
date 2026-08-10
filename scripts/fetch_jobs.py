@@ -1,8 +1,16 @@
 """
-Fetches jobs from Adzuna + Arbeitnow + Jobicy, classifies visa-sponsorship
-status, and appends ONLY NEW listings (never seen before) into a local
-JSON file (data/listings.json) that the website reads directly. No
-Google Sheet / SheetDB involved.
+Fetches visa-sponsorship jobs from Adzuna + Arbeitnow and saves results
+directly into data/listings.json inside this repository -- NO Google
+Sheets, NO SheetDB, nothing external to manage.
+
+The GitHub Actions workflow commits this updated file back to the repo
+automatically after every run, and the website reads it directly.
+
+WHY ROTATION: Adzuna's free tier only allows a limited number of searches
+per month. To still cover many countries and job categories over time
+instead of the same handful forever, this script keeps one big master
+list of every country+category combination, and each run only searches a
+SLICE of it, rotating to the next slice next time.
 
 Env vars required (set as GitHub Actions secrets):
   ADZUNA_APP_ID
@@ -20,68 +28,55 @@ import requests
 ADZUNA_APP_ID = os.environ.get("ADZUNA_APP_ID", "")
 ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
 
-# Path to the JSON file that IS the database. The site's index.html fetches
-# this file directly. Path is relative to the repo root (the workflow runs
-# scripts from the repo root).
-DATA_FILE = os.path.join("data", "listings.json")
-
 ADZUNA_ENDPOINT = "https://api.adzuna.com/v1/api/jobs/{country}/search/1"
 ARBEITNOW_ENDPOINT = "https://www.arbeitnow.com/api/job-board-api"
-JOBICY_ENDPOINT = "https://jobicy.com/api/v2/remote-jobs"
 
-TODAY = datetime.date.today().isoformat()
+TODAY = datetime.date.today()
+DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "listings.json")
 
 # ---------------------------------------------------------------------------
-# Full search matrix: every country x category combo worth checking for
-# Nigerian skilled/manual worker sponsorship. This list can be as long as
-# you want -- it does NOT all run in a single execution. Each run only
-# takes a rotating SLICE of it (see pick_todays_slice below), so the free
-# Adzuna quota is respected while the FULL matrix still gets covered over
-# a few days automatically, with no manual updating required.
-#
-# Adzuna country codes: gb, us, de, fr, nl, ca, au, ie, nz, se, no, dk, at, pl, za
+# MASTER search list: every country x category combination worth checking
+# for a Nigerian audience. Rotation (below) spreads this out automatically
+# over multiple runs so the free API budget isn't blown in one go.
+# Adzuna country codes used: au, gb, ca, de, nl, ie, nz, se, at, pl, za
 # ---------------------------------------------------------------------------
-ADZUNA_COUNTRIES = ["au", "gb", "ca", "de", "nl", "ie", "nz", "se", "at", "pl", "za"]
-ADZUNA_CATEGORIES = [
+CATEGORIES = [
+    "skilled worker visa sponsorship",
     "construction visa sponsorship",
-    "skilled trade visa sponsorship",
-    "care worker visa sponsorship",
-    "aged care worker visa sponsorship",
     "agriculture farm worker visa sponsorship",
-    "welder visa sponsorship",
-    "warehouse logistics visa sponsorship",
+    "aged care worker visa sponsorship",
+    "care worker visa sponsorship",
     "hospitality visa sponsorship",
+    "warehouse logistics visa sponsorship",
+    "driver visa sponsorship",
+    "welder electrician plumber visa sponsorship",
+    "cleaner visa sponsorship",
     "healthcare assistant visa sponsorship",
     "nursing visa sponsorship",
 ]
-FULL_MATRIX = [
-    {"country": c, "what": cat} for c in ADZUNA_COUNTRIES for cat in ADZUNA_CATEGORIES
+COUNTRIES = ["au", "gb", "ca", "de", "nl", "ie", "nz", "se", "at", "pl", "za"]
+
+MASTER_SEARCHES = [
+    {"country": c, "what": cat} for c in COUNTRIES for cat in CATEGORIES
 ]
 
-# How many combos to actually query per run. Keep this in line with your
-# Adzuna free-tier daily/monthly quota and how many times a day the GitHub
-# Actions workflow runs. 8 combos x 4 runs/day = 32 calls/day, well inside
-# a 1000/month free allowance.
-COMBOS_PER_RUN = 8
+SEARCHES_PER_RUN = 8  # keeps well inside Adzuna's free monthly quota
 
 
-def pick_todays_slice(matrix: list, size: int) -> list:
-    """Rotate through the full matrix automatically based on the day of
-    year, so every combo gets covered on a cycle without any manual
-    editing. No two consecutive days query the exact same slice."""
-    if not matrix:
-        return []
-    day_index = datetime.date.today().timetuple().tm_yday
-    start = (day_index * size) % len(matrix)
-    # wrap around the end of the list back to the start
-    return [matrix[(start + i) % len(matrix)] for i in range(size)]
+def get_todays_batch():
+    """Rotate which slice of MASTER_SEARCHES runs today, based on day of
+    year and 6-hour time slot, so the whole matrix cycles through
+    automatically over about a week with no manual updating."""
+    hour_slot = datetime.datetime.utcnow().hour // 6  # 0,1,2,3
+    rotation_index = TODAY.timetuple().tm_yday * 4 + hour_slot
+    total_batches = max(1, len(MASTER_SEARCHES) // SEARCHES_PER_RUN)
+    batch_number = rotation_index % total_batches
+    start = batch_number * SEARCHES_PER_RUN
+    return MASTER_SEARCHES[start:start + SEARCHES_PER_RUN]
 
-
-ADZUNA_SEARCHES = pick_todays_slice(FULL_MATRIX, COMBOS_PER_RUN)
 
 # ---------------------------------------------------------------------------
-# Visa sponsorship keyword classifier (Adzuna results aren't structurally
-# tagged, so we scan the text). Arbeitnow is tagged natively by the platform.
+# Visa sponsorship keyword classifier
 # ---------------------------------------------------------------------------
 POSITIVE_PHRASES = [
     "visa sponsorship", "visa sponsorship considered", "sponsorship available",
@@ -95,7 +90,7 @@ NEGATIVE_PHRASES = [
 ]
 
 
-def classify_sponsorship(text: str) -> str:
+def classify_sponsorship(text):
     t = (text or "").lower()
     for phrase in NEGATIVE_PHRASES:
         if phrase in t:
@@ -106,43 +101,47 @@ def classify_sponsorship(text: str) -> str:
     return "UNCLEAR"
 
 
-def make_id(url: str) -> str:
+def make_id(url):
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
 
 
 # ---------------------------------------------------------------------------
-# Duplicate prevention -- read what's already in the local JSON file BEFORE
-# fetching, so we never re-add a listing that's already there.
+# Local JSON file storage (replaces Google Sheets / SheetDB entirely)
 # ---------------------------------------------------------------------------
-def load_existing_rows() -> list:
+def load_existing():
     if not os.path.exists(DATA_FILE):
         return []
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        return rows if isinstance(rows, list) else []
+            return json.load(f)
     except Exception as e:
-        print(f"Could not read {DATA_FILE} (starting fresh): {e}")
+        print(f"Could not read existing data file, starting fresh: {e}")
         return []
 
 
+def save_data(rows):
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
-# Platform fetchers -- each returns a list of normalized row dicts
+# Platform fetchers
 # ---------------------------------------------------------------------------
-def fetch_adzuna():
+def fetch_adzuna(batch):
     rows = []
     if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
         print("Skipping Adzuna (no ADZUNA_APP_ID/ADZUNA_APP_KEY set)")
         return rows
 
-    for search in ADZUNA_SEARCHES:
+    for search in batch:
         url = ADZUNA_ENDPOINT.format(country=search["country"])
         params = {
             "app_id": ADZUNA_APP_ID,
             "app_key": ADZUNA_APP_KEY,
             "what": search["what"],
             "results_per_page": 20,
-            "sort_by": "date",  # newest first
+            "sort_by": "date",
             "content-type": "application/json",
         }
         try:
@@ -157,5 +156,118 @@ def fetch_adzuna():
             source_url = job.get("redirect_url", "")
             if not source_url:
                 continue
-            blob = f"{job.get('title','')} {job.get('description','')}"
-            company =
+            blob = job.get("title", "") + " " + job.get("description", "")
+            company_obj = job.get("company") or {}
+            company = company_obj.get("display_name", "")
+            location_obj = job.get("location") or {}
+            location = location_obj.get("display_name", "")
+            salary_min = job.get("salary_min")
+            salary_max = job.get("salary_max")
+            if salary_min and salary_max:
+                salary = f"{salary_min:.0f}-{salary_max:.0f}"
+            else:
+                salary = ""
+            date_posted = (job.get("created") or "")[:10]
+
+            rows.append({
+                "id": make_id(source_url),
+                "type": "job",
+                "source_platform": "Adzuna",
+                "title": job.get("title", ""),
+                "company": company,
+                "location": location,
+                "salary": salary,
+                "level": "",
+                "sponsorship_status": classify_sponsorship(blob),
+                "ielts_status": "",
+                "nigeria_note": "",
+                "application_status": "",
+                "source_url": source_url,
+                "date_posted": date_posted,
+                "deadline": "",
+                "date_scraped": TODAY.isoformat(),
+                "search_term": search["what"] + " (" + search["country"] + ")",
+                "notes": "",
+            })
+        time.sleep(1)
+    return rows
+
+
+def fetch_arbeitnow():
+    rows = []
+    params = {"visa_sponsorship": "true"}
+    try:
+        r = requests.get(ARBEITNOW_ENDPOINT, params=params, timeout=20)
+        r.raise_for_status()
+        jobs = r.json().get("data", [])
+    except Exception as e:
+        print(f"Arbeitnow fetch failed: {e}")
+        return rows
+
+    for job in jobs:
+        url = job.get("url", "")
+        if not url:
+            continue
+        created_at = job.get("created_at")
+        date_posted = ""
+        if created_at:
+            try:
+                date_posted = datetime.date.fromtimestamp(int(created_at)).isoformat()
+            except Exception:
+                date_posted = ""
+
+        rows.append({
+            "id": make_id(url),
+            "type": "job",
+            "source_platform": "Arbeitnow",
+            "title": job.get("title", ""),
+            "company": job.get("company_name", ""),
+            "location": job.get("location", ""),
+            "salary": "",
+            "level": "",
+            "sponsorship_status": "SPONSORED",
+            "ielts_status": "",
+            "nigeria_note": "",
+            "application_status": "",
+            "source_url": url,
+            "date_posted": date_posted,
+            "deadline": "",
+            "date_scraped": TODAY.isoformat(),
+            "search_term": "visa_sponsorship=true (native filter)",
+            "notes": "Verified by Arbeitnow's own visa filter, not keyword-matched.",
+        })
+    return rows
+
+
+def main():
+    batch = get_todays_batch()
+    print(f"This run's search batch ({len(batch)} searches):")
+    for s in batch:
+        print("  - " + s["what"] + " (" + s["country"] + ")")
+
+    existing = load_existing()
+    existing_ids = {row.get("id", "") for row in existing if row.get("id")}
+    print(f"File already has {len(existing_ids)} listings.")
+
+    fetched = []
+    fetched += fetch_adzuna(batch)
+    fetched += fetch_arbeitnow()
+    print(f"Fetched {len(fetched)} total listings from all platforms.")
+
+    new_rows = []
+    seen_this_run = set()
+    for row in fetched:
+        if row["id"] in existing_ids or row["id"] in seen_this_run:
+            continue
+        seen_this_run.add(row["id"])
+        new_rows.append(row)
+
+    print(f"{len(new_rows)} of those are genuinely new.")
+
+    combined = existing + new_rows
+    save_data(combined)
+    print(f"Saved {len(combined)} total listings to {DATA_FILE}")
+
+
+if __name__ == "__main__":
+    main()
