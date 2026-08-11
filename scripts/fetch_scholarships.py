@@ -48,13 +48,16 @@ LISTING_PAGES = [
 # RSS feeds -- these are built for automated reading and are far less
 # likely to block requests than a regular webpage, so they're a more
 # reliable backup if ScholarshipTab keeps returning 403 Forbidden.
+# NOTE: feed_url is discovered from the homepage (may resolve to RSS or Atom).
 RSS_FEEDS = [
     {"url": "https://deerunspost.com/", "source": "Dee Runspost", "level": "Mixed / Fully Funded"},
     {"url": "https://wemakescholars.com/blog/", "source": "WeMakeScholars", "level": "Mixed / Fully Funded"},
 ]
 
-# Confirmed, exact RSS addresses (not guessed) -- mostly government portals,
+# Confirmed, exact feed addresses (not guessed) -- mostly government portals,
 # which rarely run anti-bot protection the way commercial scholarship sites do.
+# NOTE: government portals frequently publish Atom, not RSS 2.0 -- EduCanada
+# is Atom, which is why it was returning 0 results before this fix.
 DIRECT_RSS_FEEDS = [
     {
         "url": "https://www.educanada.ca/scholarships-bourses/rss/news-nouvelles_eng.xml",
@@ -263,10 +266,11 @@ def scrape_listing_page(url, level):
 
 
 def discover_feed_url(homepage_url):
-    """Reads a site's homepage HTML and looks for the <link rel="alternate"
-    type="application/rss+xml"> tag that every WordPress/blog site publishes
-    -- this finds the REAL feed address instead of guessing common paths
-    like '/feed' which don't always exist."""
+    """Reads a site's homepage HTML and looks for the <link rel="alternate">
+    tag that every WordPress/blog site publishes -- this finds the REAL feed
+    address instead of guessing common paths like '/feed' which don't always
+    exist. Matches both RSS ("application/rss+xml") and Atom
+    ("application/atom+xml") link types, since either is valid."""
     try:
         r = requests.get(homepage_url, headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -275,16 +279,18 @@ def discover_feed_url(homepage_url):
         return None
 
     soup = BeautifulSoup(r.text, "html.parser")
-    link_tag = soup.find("link", attrs={"type": "application/rss+xml"})
-    if link_tag and link_tag.get("href"):
-        return link_tag["href"]
+    for feed_type in ("application/rss+xml", "application/atom+xml"):
+        link_tag = soup.find("link", attrs={"type": feed_type})
+        if link_tag and link_tag.get("href"):
+            return link_tag["href"]
 
-    # Common fallback paths, tried only if the tag wasn't found
-    for suffix in ["feed/", "feed", "rss/", "rss", "?feed=rss2"]:
+    # Common fallback paths, tried only if no <link> tag was found
+    for suffix in ["feed/", "feed", "rss/", "rss", "atom/", "atom.xml", "?feed=rss2"]:
         candidate = homepage_url.rstrip("/") + "/" + suffix
         try:
             test = requests.get(candidate, headers=HEADERS, timeout=10)
-            if test.status_code == 200 and "<rss" in test.text[:500].lower():
+            head = test.text[:500].lower()
+            if test.status_code == 200 and ("<rss" in head or "<feed" in head):
                 return candidate
         except Exception:
             continue
@@ -292,45 +298,106 @@ def discover_feed_url(homepage_url):
     return None
 
 
-def fetch_rss_feed(homepage_url, source_name, level):
-    """RSS feeds are XML meant for automated reading, so sites are much
-    less likely to block this than a regular scraped webpage."""
-    rows = []
+# ---------------------------------------------------------------------------
+# Feed parsing -- handles BOTH RSS 2.0 and Atom.
+#
+# Government/institutional feeds (like EduCanada) very often publish Atom,
+# not RSS 2.0. Atom uses different tag names (<entry> instead of <item>,
+# <link href="..."/> instead of <link>text</link>, <summary>/<content>
+# instead of <description>, <updated> instead of <pubDate>) and everything
+# lives under the "http://www.w3.org/2005/Atom" namespace. Matching on the
+# element's *local* name (ignoring namespace) lets one code path handle both
+# formats without needing to special-case every feed.
+# ---------------------------------------------------------------------------
 
-    feed_url = discover_feed_url(homepage_url)
-    if not feed_url:
-        print(f"  Could not find an RSS feed on {homepage_url}")
-        return rows
+def _local_name(tag):
+    return tag.split("}", 1)[-1] if "}" in tag else tag
 
-    print(f"  Found feed for {source_name}: {feed_url}")
 
-    try:
-        r = requests.get(feed_url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-    except Exception as e:
-        print(f"FAILED TO FETCH RSS {feed_url}: {e}")
-        return rows
+def _find_entries(root):
+    """Returns (entries, format) -- looks for RSS <item> first, then Atom
+    <entry>, searching at any depth/namespace."""
+    items = [el for el in root.iter() if _local_name(el.tag) == "item"]
+    if items:
+        return items, "rss"
+    entries = [el for el in root.iter() if _local_name(el.tag) == "entry"]
+    if entries:
+        return entries, "atom"
+    return [], "unknown"
 
-    items = root.findall(".//item")
-    print(f"  ({len(items)} items found in RSS feed: {source_name})")
 
-    for item in items:
-        title_el = item.find("title")
-        link_el = item.find("link")
-        desc_el = item.find("description")
-        pubdate_el = item.find("pubDate")
+def _child_text(entry, name):
+    for child in entry:
+        if _local_name(child.tag) == name:
+            return (child.text or "").strip()
+    return ""
 
-        title = title_el.text.strip() if title_el is not None and title_el.text else ""
-        link = link_el.text.strip() if link_el is not None and link_el.text else ""
-        summary = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
-        pub_date = pubdate_el.text.strip() if pubdate_el is not None and pubdate_el.text else ""
 
+def _entry_link(entry):
+    """RSS: <link>https://...</link> (value is the text content).
+    Atom: <link href="https://..." rel="alternate"/> (value is an attribute,
+    and there can be several <link> elements with different rel values)."""
+    links = [child for child in entry if _local_name(child.tag) == "link"]
+    if not links:
+        return ""
+    # Prefer an Atom "alternate" link (the human-readable page)
+    for l in links:
+        href = l.get("href")
+        if href and l.get("rel", "alternate") == "alternate":
+            return href
+    # Fall back to any href, then to RSS-style text content
+    for l in links:
+        if l.get("href"):
+            return l.get("href")
+    return (links[0].text or "").strip()
+
+
+def _clean_summary(text):
+    """Atom <summary>/<content> can contain embedded HTML markup; strip it
+    down to plain text so keyword classification works correctly."""
+    if not text:
+        return ""
+    if "<" in text and ">" in text:
+        return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    return text.strip()
+
+
+def parse_feed(xml_bytes, source_name):
+    """Parses raw feed XML bytes and returns a normalized list of
+    (title, link, summary, pub_date) tuples, regardless of RSS vs Atom."""
+    root = ET.fromstring(xml_bytes)
+    entries, feed_format = _find_entries(root)
+
+    if feed_format == "unknown":
+        print(f"  WARNING: {source_name} feed has neither <item> nor <entry> elements -- "
+              f"unrecognized feed format, 0 results.")
+        return []
+
+    print(f"  ({len(entries)} entries found in {feed_format.upper()} feed: {source_name})")
+
+    parsed = []
+    for entry in entries:
+        title = _child_text(entry, "title")
+        link = _entry_link(entry)
         if not title or not link:
             continue
 
-        deadline = extract_deadline(summary)
+        if feed_format == "atom":
+            summary = _child_text(entry, "summary") or _child_text(entry, "content")
+            pub_date = _child_text(entry, "updated") or _child_text(entry, "published")
+        else:
+            summary = _child_text(entry, "description")
+            pub_date = _child_text(entry, "pubDate")
 
+        parsed.append((title, link, _clean_summary(summary), pub_date))
+
+    return parsed
+
+
+def _rows_from_feed(xml_bytes, source_name, level, search_term):
+    rows = []
+    for title, link, summary, pub_date in parse_feed(xml_bytes, source_name):
+        deadline = extract_deadline(summary)
         rows.append({
             "id": make_id(link),
             "type": "scholarship",
@@ -348,11 +415,52 @@ def fetch_rss_feed(homepage_url, source_name, level):
             "date_posted": pub_date[:16] if pub_date else "",
             "deadline": deadline,
             "date_scraped": TODAY.isoformat(),
-            "search_term": f"RSS: {source_name}",
+            "search_term": search_term,
             "notes": "",
         })
-
     return rows
+
+
+def fetch_rss_feed(homepage_url, source_name, level):
+    """Feeds (RSS or Atom) are XML meant for automated reading, so sites are
+    much less likely to block this than a regular scraped webpage."""
+    feed_url = discover_feed_url(homepage_url)
+    if not feed_url:
+        print(f"  Could not find a feed on {homepage_url}")
+        return []
+
+    print(f"  Found feed for {source_name}: {feed_url}")
+
+    try:
+        r = requests.get(feed_url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"FAILED TO FETCH FEED {feed_url}: {e}")
+        return []
+
+    try:
+        return _rows_from_feed(r.content, source_name, level, f"RSS: {source_name}")
+    except ET.ParseError as e:
+        print(f"FAILED TO PARSE FEED {feed_url}: {e}")
+        return []
+
+
+def fetch_direct_rss(feed_url, source_name, level):
+    """For confirmed, exact feed addresses -- skips the discovery step
+    entirely since we already know the real feed URL. Handles RSS and Atom
+    equally (see parse_feed above)."""
+    try:
+        r = requests.get(feed_url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"FAILED TO FETCH RSS {feed_url}: {e}")
+        return []
+
+    try:
+        return _rows_from_feed(r.content, source_name, level, f"RSS: {source_name}")
+    except ET.ParseError as e:
+        print(f"FAILED TO PARSE FEED {feed_url}: {e}")
+        return []
 
 
 def fetch_scholarship_api():
@@ -431,61 +539,6 @@ def fetch_scholarship_api():
                 "notes": "",
             })
         time.sleep(1)
-
-    return rows
-
-
-def fetch_direct_rss(feed_url, source_name, level):
-    """For confirmed, exact RSS addresses -- skips the discovery step
-    entirely since we already know the real feed URL."""
-    rows = []
-    try:
-        r = requests.get(feed_url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-    except Exception as e:
-        print(f"FAILED TO FETCH RSS {feed_url}: {e}")
-        return rows
-
-    items = root.findall(".//item")
-    print(f"  ({len(items)} items found in RSS feed: {source_name})")
-
-    for item in items:
-        title_el = item.find("title")
-        link_el = item.find("link")
-        desc_el = item.find("description")
-        pubdate_el = item.find("pubDate")
-
-        title = title_el.text.strip() if title_el is not None and title_el.text else ""
-        link = link_el.text.strip() if link_el is not None and link_el.text else ""
-        summary = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
-        pub_date = pubdate_el.text.strip() if pubdate_el is not None and pubdate_el.text else ""
-
-        if not title or not link:
-            continue
-
-        deadline = extract_deadline(summary)
-
-        rows.append({
-            "id": make_id(link),
-            "type": "scholarship",
-            "source_platform": source_name,
-            "title": title,
-            "company": "",
-            "location": "",
-            "salary": "",
-            "level": level,
-            "sponsorship_status": classify_funding(summary),
-            "ielts_status": classify_ielts(summary),
-            "nigeria_note": classify_nigeria_note(summary),
-            "application_status": classify_application_status(deadline),
-            "source_url": link,
-            "date_posted": pub_date[:16] if pub_date else "",
-            "deadline": deadline,
-            "date_scraped": TODAY.isoformat(),
-            "search_term": f"RSS: {source_name}",
-            "notes": "",
-        })
 
     return rows
 
