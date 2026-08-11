@@ -244,6 +244,44 @@ def save_data(rows):
         json.dump(rows, f, indent=2, ensure_ascii=False)
 
 
+def clean_existing_jobs(rows):
+    """One-time (and ongoing) cleanup: removes job listings that were saved
+    BEFORE the tech-job filter and category classifier existed. Without
+    this, old tech jobs saved by the previous version of this script would
+    sit in listings.json forever, since the rest of the script only ever
+    ADDS new rows -- it never re-checks old ones. Scholarship rows
+    (type == "scholarship") are left untouched."""
+    cleaned = []
+    removed = 0
+    for row in rows:
+        if row.get("type") != "job":
+            cleaned.append(row)
+            continue
+
+        blob = f"{row.get('title', '')} {row.get('company', '')} {row.get('notes', '')}"
+
+        if is_tech_job(blob):
+            removed += 1
+            continue
+
+        category = row.get("category") or classify_category(blob)
+        if not category:
+            removed += 1
+            continue
+
+        # backfill the category field for older rows saved before it existed
+        if not row.get("category"):
+            row["category"] = category
+        if not row.get("employer_type"):
+            row["employer_type"] = classify_employer_type(row.get("company", ""), blob)
+
+        cleaned.append(row)
+
+    if removed:
+        print(f"Cleanup: removed {removed} old listings that no longer match target categories (tech/unclassified jobs).")
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Platform fetchers
 # ---------------------------------------------------------------------------
@@ -402,8 +440,10 @@ def main():
         print("  - " + s["what"] + " (" + s["country"] + ")")
 
     existing = load_existing()
+    print(f"File already has {len(existing)} listings.")
+    existing = clean_existing_jobs(existing)
     existing_ids = {row.get("id", "") for row in existing if row.get("id")}
-    print(f"File already has {len(existing_ids)} listings.")
+    print(f"{len(existing)} listings remain after removing outdated tech/unclassified jobs.")
 
     fetched = []
     fetched += fetch_adzuna(batch)
