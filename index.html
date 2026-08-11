@@ -243,6 +243,22 @@
     font-size:0.9rem;
   }
 
+  .sources{
+    background: #0a213c;
+    border-top: 1px solid rgba(184,137,46,0.25);
+    border-bottom: 1px solid rgba(184,137,46,0.25);
+  }
+  .sources-inner{
+    max-width:1100px; margin:0 auto; padding:1.25rem 1.3rem;
+    display:flex; gap:1.2rem; align-items:center; justify-content:space-between;
+    flex-wrap:wrap;
+  }
+  .sources-title{color:var(--gold); font-family:'IBM Plex Mono',monospace; text-transform:uppercase; letter-spacing:.08em; font-size:.72rem; font-weight:700;}
+  .sources-note{color:rgba(243,238,221,.62); font-size:.78rem; max-width:480px; margin-top:.25rem;}
+  .source-links{display:flex; flex-wrap:wrap; gap:.45rem;}
+  .source-links a{color:var(--parchment); border:1px solid rgba(243,238,221,.18); padding:.4rem .6rem; border-radius:3px; font-size:.75rem; text-decoration:none;}
+  .source-links a:hover{border-color:var(--gold); color:var(--gold);}
+
   footer{
     text-align:center;
     padding: 2rem 1.5rem 2.6rem;
@@ -270,7 +286,7 @@
 <header>
   <div class="eyebrow">ClearMark Creative &middot; Global Travel Agency</div>
   <h1>Opportunity Desk</h1>
-  <p class="tagline">Live-screened jobs and scholarships, stamped by sponsorship &amp; funding status — so you stop searching and start applying.</p>
+  <p class="tagline">Live-screened jobs and scholarships from multiple sources, with country, funding and sponsorship filters — so you can find opportunities faster.</p>
   <div class="updated mono" id="lastUpdated">Loading feed…</div>
 </header>
 
@@ -295,6 +311,18 @@
     <option value="Arbeitnow">Arbeitnow</option>
     <option value="ScholarshipTab">ScholarshipTab</option>
   </select>
+  <select id="countryFilter">
+    <option value="all">All countries</option>
+  </select>
+  <select id="categoryFilter">
+    <option value="all">All job categories</option>
+  </select>
+  <select id="applicationFilter">
+    <option value="all">All application statuses</option>
+    <option value="OPEN">Open now</option>
+    <option value="CLOSED">Closed</option>
+    <option value="UNKNOWN">Deadline not stated</option>
+  </select>
   <select id="levelFilter">
     <option value="all">All levels</option>
     <option value="Undergraduate">Undergraduate</option>
@@ -310,6 +338,25 @@
   </select>
 </div>
 
+<section class="sources" aria-label="Specialist job sources">
+  <div class="sources-inner">
+    <div>
+      <div class="sources-title">More visa-sponsorship sources</div>
+      <div class="sources-note">These are specialist/external job sources. Sponsorship is role- and employer-specific, so always verify the advert before applying.</div>
+    </div>
+    <div class="source-links">
+      <a href="https://www.carejobz.com.au/find-healthcare-jobs-or-hire-healthcare-staff/" target="_blank" rel="noopener noreferrer">Carejobz · Australia &amp; New Zealand healthcare</a>
+      <a href="https://www.carejobz.com.au/healthcare-jobs-in-australia/" target="_blank" rel="noopener noreferrer">Carejobz · Australia healthcare</a>
+      <a href="https://www.carejobz.com.au/new-zealand/" target="_blank" rel="noopener noreferrer">Carejobz · New Zealand</a>
+      <a href="https://www.jobbank.gc.ca/browsejobs/wage-outlook" target="_blank" rel="noopener noreferrer">Canada Job Bank</a>
+      <a href="https://findajob.dwp.gov.uk/" target="_blank" rel="noopener noreferrer">UK Find a Job</a>
+      <a href="https://www.bayt.com/en/" target="_blank" rel="noopener noreferrer">Bayt · Gulf &amp; Middle East</a>
+      <a href="https://www.gulftalent.com/" target="_blank" rel="noopener noreferrer">GulfTalent · Gulf &amp; Middle East</a>
+      <a href="https://www.naukrigulf.com/" target="_blank" rel="noopener noreferrer">NaukriGulf · Gulf &amp; Middle East</a>
+    </div>
+  </div>
+</section>
+
 <main>
   <div class="count-row" id="countRow"></div>
   <div class="grid" id="grid"></div>
@@ -323,7 +370,8 @@
 <script>
   // Reads listings directly from this repo's own data file -- no external
   // service, no Google Sheets, no SheetDB. GitHub Actions updates this
-  // file automatically every 6 hours.
+  // file automatically every 6 hours. The country filter is built from the
+  // actual countries returned by the sources.
   const DATA_URL = "data/listings.json";
 
   let allRows = [];
@@ -348,6 +396,9 @@
     const type = document.getElementById("typeFilter").value;
     const status = document.getElementById("statusFilter").value;
     const platform = document.getElementById("platformFilter").value;
+    const country = document.getElementById("countryFilter").value;
+    const category = document.getElementById("categoryFilter").value;
+    const application = document.getElementById("applicationFilter").value;
     const level = document.getElementById("levelFilter").value;
     const ielts = document.getElementById("ieltsFilter").value;
 
@@ -355,6 +406,9 @@
       if(type !== "all" && row.type !== type) return false;
       if(status !== "all" && row.sponsorship_status !== status) return false;
       if(platform !== "all" && row.source_platform !== platform) return false;
+      if(country !== "all" && (row.country || row.location || "") !== country) return false;
+      if(category !== "all" && (row.category || "Other skilled / general") !== category) return false;
+      if(application !== "all" && (row.application_status || "UNKNOWN") !== application) return false;
       if(level !== "all" && row.level !== level) return false;
       if(ielts !== "all" && row.ielts_status !== ielts) return false;
       if(search){
@@ -378,6 +432,7 @@
         <h3>${escapeHtml(row.title || "Untitled listing")}</h3>
         ${row.company ? `<div class="meta"><strong>${escapeHtml(row.company)}</strong></div>` : ""}
         ${row.location ? `<div class="meta">${escapeHtml(row.location)}</div>` : ""}
+        ${row.country && row.country !== row.location ? `<div class="meta">Country: <strong>${escapeHtml(row.country)}</strong></div>` : ""}
         ${row.salary ? `<div class="meta">${escapeHtml(row.salary)}</div>` : ""}
         ${row.level ? `<div class="meta">Level: <strong>${escapeHtml(row.level)}</strong></div>` : ""}
         ${row.ielts_status ? `<div class="meta">IELTS: <strong>${escapeHtml(row.ielts_status)}</strong></div>` : ""}
@@ -387,7 +442,7 @@
           <span class="posted">Posted: ${escapeHtml(row.date_posted || "Not stated")}</span>
           <span class="deadline">Deadline: ${escapeHtml(row.deadline || "Not stated")}</span>
         </div>
-        <a class="view-link" href="${row.source_url}" target="_blank" rel="noopener">View original listing →</a>
+        <a class="view-link" href="${escapeAttr(row.source_url)}" target="_blank" rel="noopener noreferrer">View original listing →</a>
       </div>
     `).join("");
   }
@@ -398,12 +453,46 @@
     return d.innerHTML;
   }
 
+  function escapeAttr(str){
+    return String(str || "").replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function populateCountryFilter(rows){
+    const select = document.getElementById("countryFilter");
+    const countries = [...new Set(rows
+      .map(row => row.country || row.location || "")
+      .filter(Boolean)
+      .flatMap(value => value.split(",").map(x => x.trim()))
+    )].sort((a,b) => a.localeCompare(b));
+
+    select.innerHTML = `<option value="all">All countries</option>` +
+      countries.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+  }
+
+  function populateCategoryFilter(rows){
+    const select = document.getElementById("categoryFilter");
+    const categories = [...new Set(rows.map(row => row.category).filter(Boolean))]
+      .sort((a,b) => a.localeCompare(b));
+    select.innerHTML = `<option value="all">All job categories</option>` +
+      categories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+  }
+
   async function loadData(){
     try{
       // cache-busting so the browser always grabs the newest file
       const res = await fetch(DATA_URL + "?t=" + Date.now());
       const data = await res.json();
       allRows = Array.isArray(data) ? data : [];
+      populateCountryFilter(allRows);
+      populateCategoryFilter(allRows);
+      // Newest listings first, with open scholarships/jobs before closed records.
+      allRows.sort((a,b) => {
+        const openScore = (b.application_status === "OPEN" ? 1 : 0) - (a.application_status === "OPEN" ? 1 : 0);
+        if(openScore) return openScore;
+        return String(b.date_posted || b.date_scraped || "").localeCompare(String(a.date_posted || a.date_scraped || ""));
+      });
       document.getElementById("lastUpdated").textContent =
         `Feed live · ${allRows.length} listings tracked`;
       render();
@@ -417,6 +506,9 @@
   document.getElementById("typeFilter").addEventListener("change", render);
   document.getElementById("statusFilter").addEventListener("change", render);
   document.getElementById("platformFilter").addEventListener("change", render);
+  document.getElementById("countryFilter").addEventListener("change", render);
+  document.getElementById("categoryFilter").addEventListener("change", render);
+  document.getElementById("applicationFilter").addEventListener("change", render);
   document.getElementById("levelFilter").addEventListener("change", render);
   document.getElementById("ieltsFilter").addEventListener("change", render);
 
