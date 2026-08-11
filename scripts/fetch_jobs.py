@@ -6,11 +6,15 @@ Sheets, NO SheetDB, nothing external to manage.
 The GitHub Actions workflow commits this updated file back to the repo
 automatically after every run, and the website reads it directly.
 
+FOCUS: this feed is built for roles most Nigerians applying through Global
+Travel Agency are actually looking for -- construction, cleaning,
+hospitality, care work, warehouse/logistics, driving, agriculture, and
+skilled trades. Tech/IT/office jobs are deliberately excluded.
+
 WHY ROTATION: Adzuna's free tier only allows a limited number of searches
-per month. To still cover many countries and job categories over time
-instead of the same handful forever, this script keeps one big master
-list of every country+category combination, and each run only searches a
-SLICE of it, rotating to the next slice next time.
+per month. Construction and cleaning searches run on EVERY execution (so
+those categories are never starved), while the remaining blue-collar
+categories rotate through a larger matrix of countries over time.
 
 Env vars required (set as GitHub Actions secrets):
   ADZUNA_APP_ID
@@ -35,44 +39,73 @@ TODAY = datetime.date.today()
 DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "listings.json")
 
 # ---------------------------------------------------------------------------
-# MASTER search list: every country x category combination worth checking
-# for a Nigerian audience. Rotation (below) spreads this out automatically
-# over multiple runs so the free API budget isn't blown in one go.
-# Adzuna country codes used: au, gb, ca, de, nl, ie, nz, se, at, pl, za
+# PRIORITY categories -- these run on EVERY execution, no rotation, so
+# construction and cleaning jobs are never skipped in favour of anything
+# else. Countries for these still rotate so coverage spreads over time.
 # ---------------------------------------------------------------------------
-CATEGORIES = [
-    "skilled worker visa sponsorship",
-    "construction visa sponsorship",
+PRIORITY_CATEGORIES = [
+    "construction laborer visa sponsorship",
+    "construction worker visa sponsorship",
+    "general labourer visa sponsorship",
+    "bricklayer mason visa sponsorship",
+    "scaffolder visa sponsorship",
+    "cleaner visa sponsorship",
+    "cleaning operative visa sponsorship",
+    "housekeeping visa sponsorship",
+    "janitor visa sponsorship",
+]
+
+# ---------------------------------------------------------------------------
+# Other blue-collar categories worth checking for a Nigerian audience.
+# These rotate through the country matrix over multiple runs.
+# Deliberately NO tech/IT/office/professional categories in here.
+# ---------------------------------------------------------------------------
+OTHER_CATEGORIES = [
     "agriculture farm worker visa sponsorship",
     "aged care worker visa sponsorship",
     "care worker visa sponsorship",
-    "hospitality visa sponsorship",
+    "hospitality hotel visa sponsorship",
+    "kitchen porter chef visa sponsorship",
     "warehouse logistics visa sponsorship",
     "driver visa sponsorship",
     "welder electrician plumber visa sponsorship",
-    "cleaner visa sponsorship",
     "healthcare assistant visa sponsorship",
-    "nursing visa sponsorship",
+    "meat processing factory worker visa sponsorship",
+    "security guard visa sponsorship",
 ]
+
 COUNTRIES = ["au", "gb", "ca", "de", "nl", "at", "pl", "za", "sg", "it", "fr"]
 
-MASTER_SEARCHES = [
-    {"country": c, "what": cat} for c in COUNTRIES for cat in CATEGORIES
+PRIORITY_SEARCHES = [
+    {"country": c, "what": cat} for c in COUNTRIES for cat in PRIORITY_CATEGORIES
+]
+ROTATING_SEARCHES = [
+    {"country": c, "what": cat} for c in COUNTRIES for cat in OTHER_CATEGORIES
 ]
 
-SEARCHES_PER_RUN = 8  # keeps well inside Adzuna's free monthly quota
+# Total Adzuna calls per run, split between the two pools below.
+PRIORITY_PER_RUN = 4   # always construction/cleaning
+ROTATING_PER_RUN = 4   # rotates through everything else
+
+
+def _rotate_slice(pool, size):
+    """Picks a rotating slice of `pool`, advancing based on day-of-year and
+    6-hour time slot so it cycles through the whole matrix automatically
+    with no manual updating."""
+    if not pool:
+        return []
+    hour_slot = datetime.datetime.utcnow().hour // 6  # 0,1,2,3
+    rotation_index = TODAY.timetuple().tm_yday * 4 + hour_slot
+    total_batches = max(1, len(pool) // size)
+    batch_number = rotation_index % total_batches
+    start = batch_number * size
+    return pool[start:start + size]
 
 
 def get_todays_batch():
-    """Rotate which slice of MASTER_SEARCHES runs today, based on day of
-    year and 6-hour time slot, so the whole matrix cycles through
-    automatically over about a week with no manual updating."""
-    hour_slot = datetime.datetime.utcnow().hour // 6  # 0,1,2,3
-    rotation_index = TODAY.timetuple().tm_yday * 4 + hour_slot
-    total_batches = max(1, len(MASTER_SEARCHES) // SEARCHES_PER_RUN)
-    batch_number = rotation_index % total_batches
-    start = batch_number * SEARCHES_PER_RUN
-    return MASTER_SEARCHES[start:start + SEARCHES_PER_RUN]
+    priority = _rotate_slice(PRIORITY_SEARCHES, PRIORITY_PER_RUN)
+    rotating = _rotate_slice(ROTATING_SEARCHES, ROTATING_PER_RUN)
+    return priority + rotating
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +131,92 @@ def classify_sponsorship(text):
     for phrase in POSITIVE_PHRASES:
         if phrase in t:
             return "SPONSORED"
+    return "UNCLEAR"
+
+
+# ---------------------------------------------------------------------------
+# Category classifier -- labels each job so the site can filter/display by
+# type, and so anything that doesn't match a real blue-collar category (i.e.
+# tech/office jobs slipping through Arbeitnow's general feed) gets dropped.
+# ---------------------------------------------------------------------------
+CATEGORY_KEYWORDS = {
+    "Construction": [
+        "construction", "laborer", "labourer", "bricklayer", "mason",
+        "scaffold", "site worker", "carpenter", "roofer", "groundworker",
+        "concrete", "builder",
+    ],
+    "Cleaning": [
+        "cleaner", "cleaning", "housekeeping", "janitor", "custodian",
+        "sanitation",
+    ],
+    "Hospitality": [
+        "hospitality", "hotel", "kitchen porter", "chef", "cook", "waiter",
+        "waitress", "catering", "barista", "bartender",
+    ],
+    "Care Work": [
+        "care worker", "aged care", "healthcare assistant", "carer",
+        "support worker", "nursing assistant",
+    ],
+    "Warehouse & Logistics": [
+        "warehouse", "logistics", "picker", "packer", "forklift",
+        "distribution centre", "distribution center",
+    ],
+    "Driving": ["driver", "delivery driver", "hgv", "lorry", "truck driver"],
+    "Agriculture": [
+        "farm worker", "agriculture", "harvest", "fruit picker", "abattoir",
+        "meat processing", "poultry",
+    ],
+    "Skilled Trades": ["welder", "electrician", "plumber", "fitter"],
+    "Security": ["security guard", "security officer"],
+}
+
+# Any job whose title/description strongly matches these is almost
+# certainly a tech/IT/office role -- explicitly excluded even if it
+# happens to carry a "visa sponsorship" tag.
+TECH_EXCLUDE_KEYWORDS = [
+    "software", "developer", "engineer", "engineering", "devops", "backend",
+    "frontend", "full stack", "full-stack", "data scientist", "data analyst",
+    "product manager", "product owner", "ux designer", "ui designer",
+    "qa engineer", "cyber security", "cybersecurity", "it support",
+    "sysadmin", "cloud engineer", "machine learning", "artificial intelligence",
+    "python developer", "java developer", "javascript", "react developer",
+    "node.js", "sql developer", "network engineer", "it technician",
+    "help desk", "scrum master", "programmer", "web designer",
+]
+
+
+def classify_category(text):
+    t = (text or "").lower()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in t:
+                return category
+    return ""  # no match -- not one of our target categories
+
+
+def is_tech_job(text):
+    t = (text or "").lower()
+    return any(kw in t for kw in TECH_EXCLUDE_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Employer-type classifier -- flags likely recruitment/staffing agency
+# postings vs. what looks like a direct employer, since the goal is real,
+# legit jobs with sponsorship straight from the hiring company.
+# ---------------------------------------------------------------------------
+AGENCY_KEYWORDS = [
+    "recruitment", "recruiting", "staffing", "manpower", "employment agency",
+    "personnel", "talent solutions", "labour hire", "labor hire", "hr solutions",
+]
+
+
+def classify_employer_type(company, text):
+    combined = f"{company or ''} {text or ''}".lower()
+    for kw in AGENCY_KEYWORDS:
+        if kw in combined:
+            return "LIKELY RECRUITMENT AGENCY"
+    if company and company.strip():
+        return "DIRECT EMPLOYER"
     return "UNCLEAR"
 
 
@@ -152,11 +271,22 @@ def fetch_adzuna(batch):
             print(f"Adzuna search failed for {search}: {e}")
             continue
 
+        kept = 0
         for job in results:
             source_url = job.get("redirect_url", "")
             if not source_url:
                 continue
-            blob = job.get("title", "") + " " + job.get("description", "")
+            title = job.get("title", "")
+            description = job.get("description", "")
+            blob = title + " " + description
+
+            if is_tech_job(blob):
+                continue  # explicitly excluded even if it had a sponsorship tag
+
+            category = classify_category(blob)
+            if not category:
+                continue  # doesn't match construction/cleaning/etc -- skip it
+
             company_obj = job.get("company") or {}
             company = company_obj.get("display_name", "")
             location_obj = job.get("location") or {}
@@ -173,10 +303,12 @@ def fetch_adzuna(batch):
                 "id": make_id(source_url),
                 "type": "job",
                 "source_platform": "Adzuna",
-                "title": job.get("title", ""),
+                "title": title,
                 "company": company,
                 "location": location,
                 "salary": salary,
+                "category": category,
+                "employer_type": classify_employer_type(company, blob),
                 "level": "",
                 "sponsorship_status": classify_sponsorship(blob),
                 "ielts_status": "",
@@ -189,11 +321,16 @@ def fetch_adzuna(batch):
                 "search_term": search["what"] + " (" + search["country"] + ")",
                 "notes": "",
             })
+            kept += 1
+        print(f"  Adzuna '{search['what']}' ({search['country']}): {len(results)} results, {kept} kept after filtering")
         time.sleep(1)
     return rows
 
 
 def fetch_arbeitnow():
+    """Arbeitnow's general feed is heavily tech/IT-skewed, so results are
+    filtered hard here: a job only survives if it matches one of our target
+    blue-collar categories AND does not look like a tech role."""
     rows = []
     params = {"visa_sponsorship": "true"}
     try:
@@ -204,10 +341,23 @@ def fetch_arbeitnow():
         print(f"Arbeitnow fetch failed: {e}")
         return rows
 
+    kept = 0
     for job in jobs:
         url = job.get("url", "")
         if not url:
             continue
+        title = job.get("title", "")
+        description = job.get("description", "")
+        tags = " ".join(job.get("tags", []) or [])
+        blob = f"{title} {description} {tags}"
+
+        if is_tech_job(blob):
+            continue
+
+        category = classify_category(blob)
+        if not category:
+            continue
+
         created_at = job.get("created_at")
         date_posted = ""
         if created_at:
@@ -216,14 +366,18 @@ def fetch_arbeitnow():
             except Exception:
                 date_posted = ""
 
+        company = job.get("company_name", "")
+
         rows.append({
             "id": make_id(url),
             "type": "job",
             "source_platform": "Arbeitnow",
-            "title": job.get("title", ""),
-            "company": job.get("company_name", ""),
+            "title": title,
+            "company": company,
             "location": job.get("location", ""),
             "salary": "",
+            "category": category,
+            "employer_type": classify_employer_type(company, blob),
             "level": "",
             "sponsorship_status": "SPONSORED",
             "ielts_status": "",
@@ -236,6 +390,8 @@ def fetch_arbeitnow():
             "search_term": "visa_sponsorship=true (native filter)",
             "notes": "Verified by Arbeitnow's own visa filter, not keyword-matched.",
         })
+        kept += 1
+    print(f"  Arbeitnow: {len(jobs)} sponsored jobs returned, {kept} kept after removing tech/non-target roles")
     return rows
 
 
@@ -252,7 +408,7 @@ def main():
     fetched = []
     fetched += fetch_adzuna(batch)
     fetched += fetch_arbeitnow()
-    print(f"Fetched {len(fetched)} total listings from all platforms.")
+    print(f"Fetched {len(fetched)} total listings from all platforms (after category/tech filtering).")
 
     new_rows = []
     seen_this_run = set()
