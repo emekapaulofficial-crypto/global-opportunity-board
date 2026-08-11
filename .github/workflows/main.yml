@@ -37,6 +37,7 @@ jobs:
         run: |
           git config user.name "opportunity-desk-bot"
           git config user.email "actions@github.com"
-          git add data/listings.json
+          git add listings.json
           git diff --quiet --cached || git commit -m "Auto-update listings"
-          git push
+          git pull --rebase origin main
+          git push origin main
