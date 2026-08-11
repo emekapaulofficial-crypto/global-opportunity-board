@@ -24,6 +24,20 @@ from bs4 import BeautifulSoup
 TODAY = datetime.date.today()
 DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "listings.json")
 
+SCHOLARSHIP_API_KEY = os.environ.get("SCHOLARSHIP_API_KEY", "")
+SCHOLARSHIP_API_ENDPOINT = "https://api.scholarshipapi.com/v1/search"
+
+# Queries to run against ScholarshipAPI each time. Kept modest -- free tier
+# allows 100 requests/day, script runs 4x/day, so this stays well inside
+# that limit even with room to spare.
+SCHOLARSHIP_API_QUERIES = [
+    {"q": "international students", "level": "Mixed / Fully Funded"},
+    {"q": "undergraduate", "level": "Undergraduate"},
+    {"q": "masters", "level": "Masters"},
+    {"q": "phd", "level": "PhD / Postgraduate"},
+    {"q": "fully funded", "level": "Mixed / Fully Funded"},
+]
+
 LISTING_PAGES = [
     {"url": "https://scholarshiptab.com/scholarships/undergraduate", "level": "Undergraduate"},
     {"url": "https://scholarshiptab.com/scholarships/masters", "level": "Masters"},
@@ -37,6 +51,16 @@ LISTING_PAGES = [
 RSS_FEEDS = [
     {"url": "https://deerunspost.com/", "source": "Dee Runspost", "level": "Mixed / Fully Funded"},
     {"url": "https://wemakescholars.com/blog/", "source": "WeMakeScholars", "level": "Mixed / Fully Funded"},
+]
+
+# Confirmed, exact RSS addresses (not guessed) -- mostly government portals,
+# which rarely run anti-bot protection the way commercial scholarship sites do.
+DIRECT_RSS_FEEDS = [
+    {
+        "url": "https://www.educanada.ca/scholarships-bourses/rss/news-nouvelles_eng.xml",
+        "source": "EduCanada (Global Affairs Canada)",
+        "level": "Mixed / Fully Funded",
+    },
 ]
 
 HEADERS = {
@@ -331,6 +355,141 @@ def fetch_rss_feed(homepage_url, source_name, level):
     return rows
 
 
+def fetch_scholarship_api():
+    """Real REST API, no scraping/blocking risk at all. Currently covers
+    Australia and New Zealand universities (their coverage is expanding).
+    Requires a free API key from scholarshipapi.com."""
+    rows = []
+    if not SCHOLARSHIP_API_KEY:
+        print("Skipping ScholarshipAPI (no SCHOLARSHIP_API_KEY set)")
+        return rows
+
+    headers = {
+        "Authorization": f"Bearer {SCHOLARSHIP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    for query in SCHOLARSHIP_API_QUERIES:
+        try:
+            r = requests.post(
+                SCHOLARSHIP_API_ENDPOINT,
+                headers=headers,
+                json={"q": query["q"], "limit": 20},
+                timeout=20,
+            )
+            r.raise_for_status()
+            hits = r.json().get("hits", [])
+        except Exception as e:
+            print(f"ScholarshipAPI query failed for '{query['q']}': {e}")
+            continue
+
+        print(f"  ScholarshipAPI '{query['q']}': {len(hits)} results")
+
+        for hit in hits:
+            name = hit.get("name", "")
+            university = hit.get("university", "")
+            amount = hit.get("amount")
+            currency = hit.get("currency", "")
+            status = (hit.get("status") or "").upper()
+            close_date_ms = hit.get("closeDate")
+            # This API doesn't return a direct application URL in its free
+            # tier response -- fall back to a search link on their site so
+            # the "View original listing" button still goes somewhere useful.
+            source_url = hit.get("url") or hit.get("applicationUrl") or \
+                f"https://scholarshipapi.com/scholarships?q={name.replace(' ', '+')}"
+
+            deadline = ""
+            if close_date_ms:
+                try:
+                    deadline = datetime.date.fromtimestamp(int(close_date_ms) / 1000).isoformat()
+                except Exception:
+                    deadline = ""
+
+            salary_display = f"{amount} {currency}" if amount and currency else ""
+
+            if not name:
+                continue
+
+            rows.append({
+                "id": make_id(source_url + name),
+                "type": "scholarship",
+                "source_platform": "ScholarshipAPI",
+                "title": name,
+                "company": university,
+                "location": "",
+                "salary": salary_display,
+                "level": query["level"],
+                "sponsorship_status": "UNCLEAR",  # amount shown, but full-vs-partial not stated by free tier
+                "ielts_status": "NOT STATED",
+                "nigeria_note": "Not stated -- verify eligibility on listing page",
+                "application_status": status if status in ("OPEN", "CLOSED") else "UNKNOWN",
+                "source_url": source_url,
+                "date_posted": "",
+                "deadline": deadline,
+                "date_scraped": TODAY.isoformat(),
+                "search_term": f"ScholarshipAPI: {query['q']}",
+                "notes": "",
+            })
+        time.sleep(1)
+
+    return rows
+
+
+def fetch_direct_rss(feed_url, source_name, level):
+    """For confirmed, exact RSS addresses -- skips the discovery step
+    entirely since we already know the real feed URL."""
+    rows = []
+    try:
+        r = requests.get(feed_url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except Exception as e:
+        print(f"FAILED TO FETCH RSS {feed_url}: {e}")
+        return rows
+
+    items = root.findall(".//item")
+    print(f"  ({len(items)} items found in RSS feed: {source_name})")
+
+    for item in items:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+        pubdate_el = item.find("pubDate")
+
+        title = title_el.text.strip() if title_el is not None and title_el.text else ""
+        link = link_el.text.strip() if link_el is not None and link_el.text else ""
+        summary = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
+        pub_date = pubdate_el.text.strip() if pubdate_el is not None and pubdate_el.text else ""
+
+        if not title or not link:
+            continue
+
+        deadline = extract_deadline(summary)
+
+        rows.append({
+            "id": make_id(link),
+            "type": "scholarship",
+            "source_platform": source_name,
+            "title": title,
+            "company": "",
+            "location": "",
+            "salary": "",
+            "level": level,
+            "sponsorship_status": classify_funding(summary),
+            "ielts_status": classify_ielts(summary),
+            "nigeria_note": classify_nigeria_note(summary),
+            "application_status": classify_application_status(deadline),
+            "source_url": link,
+            "date_posted": pub_date[:16] if pub_date else "",
+            "deadline": deadline,
+            "date_scraped": TODAY.isoformat(),
+            "search_term": f"RSS: {source_name}",
+            "notes": "",
+        })
+
+    return rows
+
+
 def load_existing():
     if not os.path.exists(DATA_FILE):
         return []
@@ -364,6 +523,13 @@ def main():
         rows = fetch_rss_feed(feed["url"], feed["source"], feed["level"])
         fetched.extend(rows)
         time.sleep(1)
+
+    for feed in DIRECT_RSS_FEEDS:
+        rows = fetch_direct_rss(feed["url"], feed["source"], feed["level"])
+        fetched.extend(rows)
+        time.sleep(1)
+
+    fetched.extend(fetch_scholarship_api())
 
     print(f"Total scholarships fetched: {len(fetched)}")
 
