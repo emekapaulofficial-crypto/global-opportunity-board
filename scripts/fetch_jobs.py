@@ -42,45 +42,49 @@ DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "listings.json
 # PRIORITY categories -- these run on EVERY execution, no rotation, so
 # construction and cleaning jobs are never skipped in favour of anything
 # else. Countries for these still rotate so coverage spreads over time.
+#
+# IMPORTANT: each entry is a set of OCCUPATION words only -- no "visa
+# sponsorship" text. Adzuna's default search requires every word in the
+# query to appear together, so a query like "bricklayer mason visa
+# sponsorship" demands a posting literally contain all four words at once,
+# which almost never happens even for genuinely sponsored jobs. Instead we
+# search broadly for the occupation (using "match any of these words") and
+# then check the actual job description for sponsorship language
+# afterward, via classify_sponsorship() -- see fetch_adzuna() below.
 # ---------------------------------------------------------------------------
 PRIORITY_CATEGORIES = [
-    "construction laborer visa sponsorship",
-    "construction worker visa sponsorship",
-    "general labourer visa sponsorship",
-    "bricklayer mason visa sponsorship",
-    "scaffolder visa sponsorship",
-    "cleaner visa sponsorship",
-    "cleaning operative visa sponsorship",
-    "housekeeping visa sponsorship",
-    "janitor visa sponsorship",
+    "construction laborer labourer builder groundworker",
+    "bricklayer mason",
+    "scaffolder",
+    "cleaner cleaning housekeeping janitor custodian",
 ]
 
 # ---------------------------------------------------------------------------
 # Other blue-collar categories worth checking for a Nigerian audience.
 # These rotate through the country matrix over multiple runs.
 # Deliberately NO tech/IT/office/professional categories in here.
+# Same "occupation words only" approach as above.
 # ---------------------------------------------------------------------------
 OTHER_CATEGORIES = [
-    "agriculture farm worker visa sponsorship",
-    "aged care worker visa sponsorship",
-    "care worker visa sponsorship",
-    "hospitality hotel visa sponsorship",
-    "kitchen porter chef visa sponsorship",
-    "warehouse logistics visa sponsorship",
-    "driver visa sponsorship",
-    "welder electrician plumber visa sponsorship",
-    "healthcare assistant visa sponsorship",
-    "meat processing factory worker visa sponsorship",
-    "security guard visa sponsorship",
+    "farm worker agriculture harvest picker",
+    "aged care carer support worker",
+    "hospitality hotel housekeeping",
+    "kitchen porter chef cook catering",
+    "warehouse logistics picker packer forklift",
+    "driver delivery hgv lorry",
+    "welder electrician plumber fitter",
+    "healthcare assistant nursing assistant",
+    "meat processing factory worker abattoir",
+    "security guard officer",
 ]
 
 COUNTRIES = ["au", "gb", "ca", "de", "nl", "at", "pl", "za", "sg", "it", "fr"]
 
 PRIORITY_SEARCHES = [
-    {"country": c, "what": cat} for c in COUNTRIES for cat in PRIORITY_CATEGORIES
+    {"country": c, "what_or": cat} for c in COUNTRIES for cat in PRIORITY_CATEGORIES
 ]
 ROTATING_SEARCHES = [
-    {"country": c, "what": cat} for c in COUNTRIES for cat in OTHER_CATEGORIES
+    {"country": c, "what_or": cat} for c in COUNTRIES for cat in OTHER_CATEGORIES
 ]
 
 # Total Adzuna calls per run, split between the two pools below.
@@ -296,8 +300,8 @@ def fetch_adzuna(batch):
         params = {
             "app_id": ADZUNA_APP_ID,
             "app_key": ADZUNA_APP_KEY,
-            "what": search["what"],
-            "results_per_page": 20,
+            "what_or": search["what_or"],
+            "results_per_page": 30,
             "sort_by": "date",
             "content-type": "application/json",
         }
@@ -325,6 +329,10 @@ def fetch_adzuna(batch):
             if not category:
                 continue  # doesn't match construction/cleaning/etc -- skip it
 
+            sponsorship_status = classify_sponsorship(blob)
+            if sponsorship_status == "NO SPONSORSHIP":
+                continue  # explicitly says no sponsorship -- not useful, skip it
+
             company_obj = job.get("company") or {}
             company = company_obj.get("display_name", "")
             location_obj = job.get("location") or {}
@@ -348,7 +356,7 @@ def fetch_adzuna(batch):
                 "category": category,
                 "employer_type": classify_employer_type(company, blob),
                 "level": "",
-                "sponsorship_status": classify_sponsorship(blob),
+                "sponsorship_status": sponsorship_status,
                 "ielts_status": "",
                 "nigeria_note": "",
                 "application_status": "",
@@ -356,11 +364,11 @@ def fetch_adzuna(batch):
                 "date_posted": date_posted,
                 "deadline": "",
                 "date_scraped": TODAY.isoformat(),
-                "search_term": search["what"] + " (" + search["country"] + ")",
+                "search_term": search["what_or"] + " (" + search["country"] + ")",
                 "notes": "",
             })
             kept += 1
-        print(f"  Adzuna '{search['what']}' ({search['country']}): {len(results)} results, {kept} kept after filtering")
+        print(f"  Adzuna '{search['what_or']}' ({search['country']}): {len(results)} results, {kept} kept after filtering")
         time.sleep(1)
     return rows
 
@@ -437,7 +445,7 @@ def main():
     batch = get_todays_batch()
     print(f"This run's search batch ({len(batch)} searches):")
     for s in batch:
-        print("  - " + s["what"] + " (" + s["country"] + ")")
+        print("  - " + s["what_or"] + " (" + s["country"] + ")")
 
     existing = load_existing()
     print(f"File already has {len(existing)} listings.")
