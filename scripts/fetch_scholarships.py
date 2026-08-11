@@ -35,8 +35,8 @@ LISTING_PAGES = [
 # likely to block requests than a regular webpage, so they're a more
 # reliable backup if ScholarshipTab keeps returning 403 Forbidden.
 RSS_FEEDS = [
-    {"url": "https://deerunspost.com/feed", "source": "Dee Runspost", "level": "Mixed / Fully Funded"},
-    {"url": "https://wemakescholars.com/blog/feed", "source": "WeMakeScholars", "level": "Mixed / Fully Funded"},
+    {"url": "https://deerunspost.com/", "source": "Dee Runspost", "level": "Mixed / Fully Funded"},
+    {"url": "https://wemakescholars.com/blog/", "source": "WeMakeScholars", "level": "Mixed / Fully Funded"},
 ]
 
 HEADERS = {
@@ -238,16 +238,54 @@ def scrape_listing_page(url, level):
     return rows
 
 
-def fetch_rss_feed(url, source_name, level):
+def discover_feed_url(homepage_url):
+    """Reads a site's homepage HTML and looks for the <link rel="alternate"
+    type="application/rss+xml"> tag that every WordPress/blog site publishes
+    -- this finds the REAL feed address instead of guessing common paths
+    like '/feed' which don't always exist."""
+    try:
+        r = requests.get(homepage_url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"  Could not load homepage {homepage_url}: {e}")
+        return None
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    link_tag = soup.find("link", attrs={"type": "application/rss+xml"})
+    if link_tag and link_tag.get("href"):
+        return link_tag["href"]
+
+    # Common fallback paths, tried only if the tag wasn't found
+    for suffix in ["feed/", "feed", "rss/", "rss", "?feed=rss2"]:
+        candidate = homepage_url.rstrip("/") + "/" + suffix
+        try:
+            test = requests.get(candidate, headers=HEADERS, timeout=10)
+            if test.status_code == 200 and "<rss" in test.text[:500].lower():
+                return candidate
+        except Exception:
+            continue
+
+    return None
+
+
+def fetch_rss_feed(homepage_url, source_name, level):
     """RSS feeds are XML meant for automated reading, so sites are much
     less likely to block this than a regular scraped webpage."""
     rows = []
+
+    feed_url = discover_feed_url(homepage_url)
+    if not feed_url:
+        print(f"  Could not find an RSS feed on {homepage_url}")
+        return rows
+
+    print(f"  Found feed for {source_name}: {feed_url}")
+
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = requests.get(feed_url, headers=HEADERS, timeout=20)
         r.raise_for_status()
         root = ET.fromstring(r.content)
     except Exception as e:
-        print(f"FAILED TO FETCH RSS {url}: {e}")
+        print(f"FAILED TO FETCH RSS {feed_url}: {e}")
         return rows
 
     items = root.findall(".//item")
